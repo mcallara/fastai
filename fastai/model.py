@@ -2,6 +2,7 @@ from .imports import *
 from .torch_imports import *
 from .core import *
 from .layer_optimizer import *
+from .fp16 import *
 
 def cut_model(m, cut):
     return list(m.children())[:cut] if cut else [m]
@@ -26,16 +27,22 @@ def num_features(m):
 
 
 class Stepper():
-    def __init__(self, m, opt, crit, clip=0, reg_fn=None):
+    def __init__(self, m, opt, crit, clip=0, reg_fn=None, fp16=False, loss_scale=1):
         self.m,self.opt,self.crit,self.clip,self.reg_fn = m,opt,crit,clip,reg_fn
+        self.fp16 = fp16
         self.reset(True)
-
+        self.loss_scale = loss_scale if fp16 else 1
+        if self.fp16: self.fp32_params = copy_model_to_fp32(m, opt)
+        
     def reset(self, train=True):
         if train: apply_leaf(self.m, set_train_mode)
         else: self.m.eval()
-        if hasattr(self.m, 'reset'): self.m.reset()
+        if hasattr(self.m, 'reset'): 
+            self.m.reset()
+            #if self.fp16: self.fp32_params = copy_model_to_fp32(self.m, self.opt)
 
     def step(self, xs, y, epoch):
+        if self.fp16: return self.step_fp16(xs, y, epoch)
         xtra = []
         output = self.m(*xs)
         if isinstance(output,tuple): output,*xtra = output
@@ -46,6 +53,25 @@ class Stepper():
         if self.clip:   # Gradient clipping
             nn.utils.clip_grad_norm(trainable_params_(self.m), self.clip)
         self.opt.step()
+        return raw_loss.data[0]
+    
+    
+    def step_fp16(self, xs, y, epoch):
+        xtra = []
+        output = self.m(*xs)
+        if isinstance(output,tuple): output,*xtra = output
+        self.m.zero_grad()
+        loss = raw_loss = self.crit(output, y)
+        if self.loss_scale != 1: loss = loss*self.loss_scale
+        if self.reg_fn: loss = self.reg_fn(output, xtra, raw_loss)
+        loss.backward()
+        update_fp32_grads(self.fp32_params, self.m)
+        if self.loss_scale != 1:
+            for param in self.fp32_params: param.grad.data.div_(self.loss_scale)
+        if self.clip:   # Gradient clipping
+            nn.utils.clip_grad_norm(trainable_params_(self.fp32_params), self.clip)
+        self.opt.step()
+        copy_fp32_to_model(self.m, self.fp32_params)
         return raw_loss.data[0]
 
     def evaluate(self, xs, y):
@@ -120,16 +146,18 @@ def print_stats(epoch, values, decimals=6):
     print(layout.format(*values))
 
 def validate(stepper, dl, metrics):
-    loss,res = [],[]
+    batch_cnts,loss,res = [],[],[]
     stepper.reset(False)
     for (*x,y) in iter(dl):
         preds,l = stepper.evaluate(VV(x), VV(y))
+        if isinstance(x,list): batch_cnts.append(len(x[0]))
+        else: batch_cnts.append(len(x))
         loss.append(to_np(l))
         res.append([f(preds.data,y) for f in metrics])
-    return [np.mean(loss)] + list(np.mean(np.stack(res),0))
+    return np.average(loss, 0, weights=batch_cnts).tolist() + np.average(np.stack(res), 0, weights=batch_cnts).tolist()
 
 def get_prediction(x):
-    if isinstance(x,(tuple,list)): x=x[0]
+    if is_listy(x): x=x[0]
     return x.data
 
 def predict(m, dl):
@@ -163,8 +191,11 @@ def model_summary(m, input_size):
             summary[m_key] = OrderedDict()
             summary[m_key]['input_shape'] = list(input[0].size())
             summary[m_key]['input_shape'][0] = -1
-            summary[m_key]['output_shape'] = list(output.size())
-            summary[m_key]['output_shape'][0] = -1
+            if is_listy(output):
+                summary[m_key]['output_shape'] = [[-1] + list(o.size())[1:] for o in output]
+            else:
+                summary[m_key]['output_shape'] = list(output.size())
+                summary[m_key]['output_shape'][0] = -1
 
             params = 0
             if hasattr(module, 'weight'):
@@ -183,7 +214,7 @@ def model_summary(m, input_size):
     hooks = []
     m.apply(register_hook)
 
-    if isinstance(input_size[0], (list, tuple)):
+    if is_listy(input_size[0]):
         x = [to_gpu(Variable(torch.rand(3,*in_size))) for in_size in input_size]
     else: x = [to_gpu(Variable(torch.rand(3,*input_size)))]
     m(*x)

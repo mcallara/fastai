@@ -8,6 +8,17 @@ from .layer_optimizer import *
 from .dataloader import DataLoader
 
 def get_cv_idxs(n, cv_idx=0, val_pct=0.2, seed=42):
+    """ Get a list of index values for Validation set from a dataset
+    
+    Arguments:
+        n : int, Total number of elements in the data set.
+        cv_idx : int, starting index [idx_start = cv_idx*int(val_pct*n)] 
+        val_pct : (int, float), validation set percentage 
+        seed : seed value for RandomState
+        
+    Returns:
+        list of indexes 
+    """
     np.random.seed(seed)
     n_val = int(val_pct*n)
     idx_start = cv_idx*n_val
@@ -302,6 +313,8 @@ class ModelData():
     @property
     def is_reg(self): return self.trn_ds.is_reg
     @property
+    def is_multi(self): return self.trn_ds.is_multi
+    @property
     def trn_ds(self): return self.trn_dl.dataset
     @property
     def val_ds(self): return self.val_dl.dataset
@@ -370,9 +383,6 @@ class ImageData(ModelData):
 
 
 class ImageClassifierData(ImageData):
-    @property
-    def is_multi(self): return self.trn_dl.dataset.is_multi
-
     @classmethod
     def from_arrays(cls, path, trn, val, bs=64, tfms=(None,None), classes=None, num_workers=4, test=None):
         """ Read in images and their labels given as numpy arrays
